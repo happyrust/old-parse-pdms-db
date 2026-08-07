@@ -53,4 +53,4 @@ pretty-hex = "0.4.1"
 
 anyhow = "1.0"
 thiserror = "*"
-aios_core = { git = "https://github.com/happyrust/rs-core.git", rev = "463d4d56", default-features = false }
+aios_core = { git = "https://github.com/happyrust/old-aios-core.git", rev = "463d4d56", default-features = false }
