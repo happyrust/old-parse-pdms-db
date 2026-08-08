@@ -47,6 +47,7 @@ pub mod dict;
 pub mod error_types;
 pub mod parse;
 pub mod parse_explict_tools;
+pub mod paged;
 pub mod refno_index;
 pub mod test_cases;
 
