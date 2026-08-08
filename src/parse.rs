@@ -460,6 +460,20 @@ pub fn parse_ele_children(input: &[u8]) -> (RefU64, RefU64Vec) {
 }
 
 /// 解析元素的基础数据（同步函数，不进行异步操作）
+fn padded_implicit_end(input: &[u8], mut end: usize) -> Result<usize> {
+    if end > input.len() {
+        return Err(anyhow!("implicit region exceeds record"));
+    }
+    while input.len().saturating_sub(end) >= 4 {
+        let value = parse_to_i32(&input[end..end + 4]);
+        if value != 0 && value != 7 {
+            break;
+        }
+        end += 4;
+    }
+    Ok(end)
+}
+
 pub fn parse_raw_ele_data_with_info(
     input: &[u8],
     database_info: &PdmsDatabaseInfo,
@@ -469,11 +483,17 @@ pub fn parse_raw_ele_data_with_info(
     let mut children = RefU64Vec::default();
     let data_len = input.len();
     let impl_len = try_parse_to_i32(&input[0..4])?; //隐含数据长度  0-4
-    if impl_len < 0 || (impl_len as usize) > data_len {
-        return Err(anyhow!("impl_len < 0 || impl_len > data_len"));
+    if impl_len < 0 {
+        return Err(anyhow!("impl_len < 0"));
     }
-    let origin_impl_len = impl_len as i32 * 4;
-    let mut actual_impl_len = origin_impl_len as usize; //隐含数据长度  0-4
+    let origin_impl_len = impl_len
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("impl_len overflow"))?;
+    let mut actual_impl_len = usize::try_from(origin_impl_len)
+        .map_err(|_| anyhow!("impl_len cannot be represented as usize"))?;
+    if actual_impl_len > data_len {
+        return Err(anyhow!("impl_len > data_len"));
+    }
     let refno: RefU64 = RefU64::from(&input[4..12]);
     let type_hash = try_parse_to_i32(&input[12..16])?;
     let noun = type_hash as u32;
@@ -487,16 +507,7 @@ pub fn parse_raw_ele_data_with_info(
         .get(&type_hash)
         .ok_or(anyhow!("{} not exist in attr_info_map", &noun_name))?;
     let owner = RefU64::from(&input[16..24]);
-    if actual_impl_len + 4 < input.len() {
-        let mut tmp_value = parse_to_i32(&input[actual_impl_len..actual_impl_len + 4]);
-        while tmp_value == 0 || tmp_value == 7 {
-            actual_impl_len += 4;
-            tmp_value = parse_to_i32(&input[actual_impl_len..actual_impl_len + 4]);
-        }
-    }
-    if actual_impl_len > data_len {
-        return Err(anyhow!("actual_impl_len > data_len"));
-    }
+    actual_impl_len = padded_implicit_end(input, actual_impl_len)?;
     //隐藏属性得数据切片
     let implicit_data = &input[0..actual_impl_len];
     let membs_pos = actual_impl_len;
@@ -4332,3 +4343,26 @@ pub(crate) static NOUN_TYPES_MAP: phf::Map<i32, &'static str> = phf_map! {
 0xD706DB5i32 => "AIDGRO",
 0xC4E0040i32 => "AIDLIN",
 };
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::padded_implicit_end;
+
+    #[test]
+    fn implicit_padding_can_reach_record_end() {
+        let input = [0_u8; 12];
+        assert_eq!(padded_implicit_end(&input, 4).unwrap(), input.len());
+    }
+
+    #[test]
+    fn implicit_padding_stops_before_member_header() {
+        let mut input = [0_u8; 12];
+        input[8..12].copy_from_slice(&2_i32.to_be_bytes());
+        assert_eq!(padded_implicit_end(&input, 4).unwrap(), 8);
+    }
+
+    #[test]
+    fn implicit_padding_rejects_declared_end_beyond_record() {
+        assert!(padded_implicit_end(&[0_u8; 8], 12).is_err());
+    }
+}
