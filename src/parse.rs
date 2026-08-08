@@ -391,15 +391,25 @@ impl EleData {
 //只是获得RefU64, 用于多线程找到所有需要处理的参考号
 pub fn parse_ele_membs(input: &[u8]) -> Vec<RefU64> {
     let mut members = vec![];
-    let mut a = parse_to_i32(&input[0..4]) as usize * 4; //隐含数据长度  0-4
-    let refno = RefI32Tuple::from(&input[4..12]);
-    let mut t = parse_to_i32(&input[a..a + 4]);
-    while t == 0 || t == 7 {
-        a += 4;
-        t = parse_to_i32(&input[a..a + 4]);
+    if input.len() < 12 {
+        return members;
     }
+    let impl_len = parse_to_i32(&input[0..4]); //隐含数据长度  0-4
+    if impl_len < 0 {
+        return members;
+    }
+    let refno = RefI32Tuple::from(&input[4..12]);
+    let Some(declared_impl_len) = (impl_len as usize).checked_mul(4) else {
+        return members;
+    };
+    let Ok(a) = padded_implicit_end(input, declared_impl_len) else {
+        return members;
+    };
     //隐藏属性得数据切片
     let membs_data = &input[a..];
+    if membs_data.len() < 12 {
+        return members;
+    }
     let maybe_refno: RefI32Tuple = (&membs_data[4..12]).into();
     let mut memb_bytes_len = 0;
 
@@ -427,22 +437,30 @@ pub fn parse_ele_membs(input: &[u8]) -> Vec<RefU64> {
 ///   - 子元素引用号的向量(RefU64Vec)
 #[inline]
 pub fn parse_ele_children(input: &[u8]) -> (RefU64, RefU64Vec) {
-    let mut children = RefU64Vec::default();
-    let mut origin_impl_len = parse_to_i32(&input[0..4]) * 4; //隐含数据长度  0-4
-    let mut actual_impl_len = origin_impl_len as usize; //隐含数据长度  0-4
+    let children = RefU64Vec::default();
+    if input.len() < 16 {
+        return (RefU64::default(), children);
+    }
+    let impl_len = parse_to_i32(&input[0..4]); //隐含数据长度  0-4
     let refno = RefI32Tuple::from(&input[4..12]);
     let type_hash = parse_to_i32(&input[12..16]);
     let noun = type_hash as u32;
-    let mut tmp_value = parse_to_i32(&input[actual_impl_len..actual_impl_len + 4]);
-
-    while tmp_value == 0 || tmp_value == 7 {
-        actual_impl_len += 4;
-        tmp_value = parse_to_i32(&input[actual_impl_len..actual_impl_len + 4]);
+    if impl_len < 0 {
+        return (refno.into(), children);
     }
+    let Some(origin_impl_len) = (impl_len as usize).checked_mul(4) else {
+        return (refno.into(), children);
+    };
+    let Ok(actual_impl_len) = padded_implicit_end(input, origin_impl_len) else {
+        return (refno.into(), children);
+    };
     //隐藏属性得数据切片
     let implicit_data = &input[0..actual_impl_len];
     let membs_pos = actual_impl_len;
     let membs_data = &input[membs_pos..];
+    if membs_data.len() < 12 {
+        return (refno.into(), children);
+    }
     let maybe_refno: RefI32Tuple = (&membs_data[4..12]).into();
     let mut memb_bytes_len = 0;
 
@@ -456,7 +474,7 @@ pub fn parse_ele_children(input: &[u8]) -> (RefU64, RefU64Vec) {
         }
     }
 
-    (refno.into(), RefU64Vec::default())
+    (refno.into(), children)
 }
 
 /// 解析元素的基础数据（同步函数，不进行异步操作）
@@ -3103,7 +3121,10 @@ pub fn gen_ref_type_pos_table_parallel(
 //00 00 00 07 00 02(maybe 01) 00 xx  (REF0)  (REF1)  00 00 00 00  00 00 00 00
 fn get_merged_data(input: &[u8], len: &mut usize, flag: u8) -> Vec<u8> {
     let input_len = input.len();
-    if *len + 4 >= input_len {
+    if input_len < 20 {
+        return Vec::new();
+    }
+    if *len < 20 || *len > input_len || *len + 4 >= input_len {
         return input[20..].to_vec();
     }
     let mut data = input[20..*len].to_vec();
@@ -3111,7 +3132,7 @@ fn get_merged_data(input: &[u8], len: &mut usize, flag: u8) -> Vec<u8> {
     //     return data;
     // }
     let mut t = *len;
-    while t + 6 <= input_len && &input[t..t + 6] == &[0x0, 0x0, 0x0, 0x7, 0x0, flag] {
+    while t + 8 <= input_len && &input[t..t + 6] == &[0x0, 0x0, 0x0, 0x7, 0x0, flag] {
         let seg_bytes_len = parse_to_u16(&input[t + 6..t + 8]) as usize * 4;
         //跳过6个byte
         let mut s = t + 4 * 6;
@@ -4346,7 +4367,21 @@ pub(crate) static NOUN_TYPES_MAP: phf::Map<i32, &'static str> = phf_map! {
 
 #[cfg(test)]
 mod boundary_tests {
-    use super::padded_implicit_end;
+    use super::{padded_implicit_end, parse_ele_children, parse_ele_membs};
+
+    fn record_with_terminal_padding() -> [u8; 168] {
+        let mut input = [0_u8; 168];
+        input[0..4].copy_from_slice(&40_i32.to_be_bytes());
+        input
+    }
+
+    fn record_with_truncated_member_block() -> [u8; 28] {
+        let mut input = [0_u8; 28];
+        input[0..4].copy_from_slice(&4_i32.to_be_bytes());
+        input[16..18].copy_from_slice(&2_u16.to_be_bytes());
+        input[18..20].copy_from_slice(&3_u16.to_be_bytes());
+        input
+    }
 
     #[test]
     fn implicit_padding_can_reach_record_end() {
@@ -4364,5 +4399,27 @@ mod boundary_tests {
     #[test]
     fn implicit_padding_rejects_declared_end_beyond_record() {
         assert!(padded_implicit_end(&[0_u8; 8], 12).is_err());
+    }
+
+    #[test]
+    fn member_scan_stops_at_record_end() {
+        assert!(parse_ele_membs(&record_with_terminal_padding()).is_empty());
+    }
+
+    #[test]
+    fn child_scan_stops_at_record_end() {
+        let (_, children) = parse_ele_children(&record_with_terminal_padding());
+        assert!(children.0.is_empty());
+    }
+
+    #[test]
+    fn member_helper_ignores_truncated_member_block() {
+        assert!(parse_ele_membs(&record_with_truncated_member_block()).is_empty());
+    }
+
+    #[test]
+    fn child_helper_ignores_truncated_member_block() {
+        let (_, children) = parse_ele_children(&record_with_truncated_member_block());
+        assert!(children.0.is_empty());
     }
 }
