@@ -45,9 +45,9 @@ pub use refno_index::{find_refno_entry, gen_ref_type_pos_table_from_index};
 pub mod consts;
 pub mod dict;
 pub mod error_types;
+pub mod paged;
 pub mod parse;
 pub mod parse_explict_tools;
-pub mod paged;
 pub mod refno_index;
 pub mod test_cases;
 

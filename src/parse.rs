@@ -239,7 +239,11 @@ pub fn parse_file_db_index_data(path: &PathBuf) -> Result<DbIndexData> {
     let mut file = File::open(path)?;
     let mut buf: Vec<u8> = Vec::new();
     file.read_to_end(&mut buf)?;
-    println!("read file {:?} finished in {:?}", path, time_start.elapsed());
+    println!(
+        "read file {:?} finished in {:?}",
+        path,
+        time_start.elapsed()
+    );
     Ok(parse_db_index_data(buf))
 }
 
@@ -339,6 +343,47 @@ pub struct EleData {
     pub whole_attmap: WholeAttMap,
     pub children: RefU64Vec,
     pub name: String,
+}
+
+/// Element identity decoded from the fixed dabacon record header.
+///
+/// Unlike [`EleData`], this type does not require the noun attribute dictionary
+/// to contain the decoded noun.  Callers can therefore classify a record even
+/// when canonical element decoding fails later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawElementIdentity {
+    pub refno: RefU64,
+    pub noun_hash: i32,
+    pub noun_name: String,
+    pub owner: RefU64,
+}
+
+/// Decode only the fixed identity fields at the beginning of an element record.
+pub fn parse_raw_element_identity(input: &[u8]) -> Result<RawElementIdentity> {
+    if input.len() < 24 {
+        return Err(anyhow!(
+            "element record identity requires 24 bytes, got {}",
+            input.len()
+        ));
+    }
+
+    let implicit_words = try_parse_to_i32(&input[0..4])?;
+    if implicit_words < 6 {
+        return Err(anyhow!(
+            "element record implicit header is too short: {implicit_words} words"
+        ));
+    }
+
+    let refno = RefU64::from(&input[4..12]);
+    let noun_hash = try_parse_to_i32(&input[12..16])?;
+    let owner = RefU64::from(&input[16..24]);
+
+    Ok(RawElementIdentity {
+        refno,
+        noun_hash,
+        noun_name: db1_dehash(noun_hash as u32),
+        owner,
+    })
 }
 
 impl EleData {
@@ -4367,7 +4412,21 @@ pub(crate) static NOUN_TYPES_MAP: phf::Map<i32, &'static str> = phf_map! {
 
 #[cfg(test)]
 mod boundary_tests {
-    use super::{padded_implicit_end, parse_ele_children, parse_ele_membs};
+    use super::{
+        padded_implicit_end, parse_ele_children, parse_ele_membs, parse_raw_ele_data,
+        parse_raw_element_identity,
+    };
+
+    fn identity_record(noun_hash: i32) -> [u8; 24] {
+        let mut input = [0_u8; 24];
+        input[0..4].copy_from_slice(&6_i32.to_be_bytes());
+        input[4..8].copy_from_slice(&17_u32.to_be_bytes());
+        input[8..12].copy_from_slice(&29_u32.to_be_bytes());
+        input[12..16].copy_from_slice(&noun_hash.to_be_bytes());
+        input[16..20].copy_from_slice(&7_u32.to_be_bytes());
+        input[20..24].copy_from_slice(&11_u32.to_be_bytes());
+        input
+    }
 
     fn record_with_terminal_padding() -> [u8; 168] {
         let mut input = [0_u8; 168];
@@ -4421,5 +4480,23 @@ mod boundary_tests {
     fn child_helper_ignores_truncated_member_block() {
         let (_, children) = parse_ele_children(&record_with_truncated_member_block());
         assert!(children.0.is_empty());
+    }
+
+    #[test]
+    fn minimal_identity_recognizes_mnum_when_canonical_decode_fails() {
+        let input = identity_record(0xC40CC);
+        let identity = parse_raw_element_identity(&input).unwrap();
+
+        assert_eq!(identity.noun_name, "MNUM");
+        assert_eq!(identity.noun_hash, 0xC40CC);
+        assert!(parse_raw_ele_data(&input).is_err());
+    }
+
+    #[test]
+    fn minimal_identity_does_not_classify_an_ordinary_noun_as_mnum() {
+        let identity = parse_raw_element_identity(&identity_record(0x861E0)).unwrap();
+
+        assert_eq!(identity.noun_name, "BOX");
+        assert_ne!(identity.noun_name, "MNUM");
     }
 }
