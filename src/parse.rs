@@ -1541,13 +1541,28 @@ pub fn parse_implicit_attr_value<'a>(
             _ => {}
         }
     } else {
-        // 隐式属性LEVEL 需要做特殊处理 map给定的是IntegerType 但其实是Vec<Int>
-        if attr_info.hash == ATT_LEVE || attr_info.hash == ATT_PTS {
-            let (bytes, len) = be_u32(bytes)?;
-            let (_, result) = count(be_i32, len as usize)(bytes)?;
-            val = IntArrayType(result);
-        } else {
-            match attr_info.default_val {
+        match attr_info.default_val {
+            IntArrayType(_) => {
+                let (array_bytes, len) = be_u32(bytes)?;
+                let len = len as usize;
+                if len > step.saturating_sub(1) {
+                    return Err(nom::Err::Failure(nom::error::make_error(
+                        bytes,
+                        ErrorKind::Verify,
+                    )));
+                }
+                let required = len.checked_mul(4).ok_or_else(|| {
+                    nom::Err::Failure(nom::error::make_error(bytes, ErrorKind::TooLarge))
+                })?;
+                if array_bytes.len() < required {
+                    return Err(nom::Err::Failure(nom::error::make_error(
+                        array_bytes,
+                        ErrorKind::Eof,
+                    )));
+                }
+                let (_, result) = count(be_i32, len)(array_bytes)?;
+                val = IntArrayType(result);
+            }
                 IntegerType(_) => {
                     let (_, r) = be_i32(bytes)?;
                     val = IntegerType(r);
@@ -1659,8 +1674,7 @@ pub fn parse_implicit_attr_value<'a>(
                     val = DoubleArrayType(data);
                 }
                 // DbAttributeType::DATETIME => {}
-                _ => {}
-            }
+            _ => {}
         }
     }
     // #[cfg(debug_assertions)]
@@ -4414,8 +4428,21 @@ pub(crate) static NOUN_TYPES_MAP: phf::Map<i32, &'static str> = phf_map! {
 mod boundary_tests {
     use super::{
         padded_implicit_end, parse_ele_children, parse_ele_membs, parse_raw_ele_data,
-        parse_raw_element_identity,
+        parse_implicit_attr_value, parse_raw_element_identity,
     };
+    use aios_core::AttrVal::IntArrayType;
+    use aios_core::pdms_types::{AttrInfo, DbAttributeType};
+
+    fn int_array_attr(offset: u32) -> AttrInfo {
+        AttrInfo {
+            name: "PROJ".into(),
+            hash: 739708,
+            offset,
+            default_val: IntArrayType(Vec::new()),
+            att_type: DbAttributeType::INTEGER,
+            ityp: None,
+        }
+    }
 
     fn identity_record(noun_hash: i32) -> [u8; 24] {
         let mut input = [0_u8; 24];
@@ -4498,5 +4525,37 @@ mod boundary_tests {
 
         assert_eq!(identity.noun_name, "BOX");
         assert_ne!(identity.noun_name, "MNUM");
+    }
+
+    #[test]
+    fn implicit_integer_array_decodes_empty_and_three_values() {
+        let attr = int_array_attr(0);
+        let empty = 0_u32.to_be_bytes();
+        let mut external = Vec::new();
+        external.extend_from_slice(&3_u32.to_be_bytes());
+        external.extend_from_slice(&65_i32.to_be_bytes());
+        external.extend_from_slice(&80_i32.to_be_bytes());
+        external.extend_from_slice(&83_i32.to_be_bytes());
+
+        let (_, empty_value) = parse_implicit_attr_value(&empty, &attr, false, 0, 4).unwrap();
+        let (_, external_value) =
+            parse_implicit_attr_value(&external, &attr, false, 0, 4).unwrap();
+
+        assert!(matches!(empty_value, IntArrayType(ref value) if value.is_empty()));
+        assert!(matches!(external_value, IntArrayType(ref value) if value == &[65, 80, 83]));
+    }
+
+    #[test]
+    fn implicit_integer_array_rejects_capacity_overflow_and_truncation() {
+        let attr = int_array_attr(0);
+        let mut overflow = Vec::new();
+        overflow.extend_from_slice(&4_u32.to_be_bytes());
+        overflow.extend_from_slice(&[0_u8; 16]);
+        let mut truncated = Vec::new();
+        truncated.extend_from_slice(&3_u32.to_be_bytes());
+        truncated.extend_from_slice(&65_i32.to_be_bytes());
+
+        assert!(parse_implicit_attr_value(&overflow, &attr, false, 0, 4).is_err());
+        assert!(parse_implicit_attr_value(&truncated, &attr, false, 0, 4).is_err());
     }
 }
