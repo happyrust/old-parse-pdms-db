@@ -53,5 +53,5 @@ pretty-hex = "0.4.1"
 
 anyhow = "1.0"
 thiserror = "*"
-aios_core = { git = "https://github.com/happyrust/old-aios-core.git", rev = "f9551ef407f4c2c870405c612e4260ce9e091416", default-features = false }
+aios_core = { git = "https://github.com/happyrust/old-aios-core.git", rev = "b216704184f5be9a230a0ec7fa90e79f60b01d34", default-features = false }
 pdmsdb_engine_v2 = { git = "https://github.com/happyrust/pdms-io.git", rev = "13a17e1f3a8ed8d18c1dcecdf10642c28654d4bb" }
