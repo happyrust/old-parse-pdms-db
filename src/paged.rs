@@ -187,6 +187,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn acp7000_paged_snapshot_uses_authoritative_latest_session() {
+        let path = Path::new(r"D:\AVEVA\Projects\E3D3.1\AvevaCatalogue\acp000\acp7000_0001");
+        if !path.exists() {
+            return;
+        }
+
+        let session = PagedDbSession::open(path).unwrap();
+        let snapshot = session.snapshot();
+
+        assert_eq!(snapshot.page_size, 2048);
+        assert_eq!(snapshot.sesno, 272);
+        assert_eq!(snapshot.session_page.page_no, 110_889);
+    }
+
     #[tokio::test]
     #[ignore = "requires the AMS real database fixture and performs one legacy full read"]
     async fn paged_record_matches_legacy_record_identity() {
