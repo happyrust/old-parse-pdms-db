@@ -1541,8 +1541,22 @@ pub fn parse_implicit_attr_value<'a>(
             _ => {}
         }
     } else {
+        // The descriptor type is authoritative: MNUM.MARK is INTVEC even
+        // though the generated schema carries StringType("") as its default.
+        if attr_info.att_type == DbAttributeType::INTVEC {
+            let (payload, len) = be_u32(bytes)?;
+            let len = len as usize;
+            let available_words = step.saturating_sub(1).min(payload.len() / 4);
+            if len > available_words {
+                return Err(nom::Err::Error(nom::error::make_error(
+                    bytes,
+                    ErrorKind::Count,
+                )));
+            }
+            let (_, result) = count(be_i32, len)(payload)?;
+            val = IntArrayType(result);
         // 隐式属性LEVEL 需要做特殊处理 map给定的是IntegerType 但其实是Vec<Int>
-        if attr_info.hash == ATT_LEVE || attr_info.hash == ATT_PTS {
+        } else if attr_info.hash == ATT_LEVE || attr_info.hash == ATT_PTS {
             let (bytes, len) = be_u32(bytes)?;
             let (_, result) = count(be_i32, len as usize)(bytes)?;
             val = IntArrayType(result);
@@ -1713,6 +1727,38 @@ pub async fn process_explicit_attrs(
     Ok(())
 }
 
+fn parse_descriptor_typed_explicit_value(
+    input: &[u8],
+    attr_type: DbAttributeType,
+) -> IResult<&[u8], Option<AttrVal>> {
+    match attr_type {
+        DbAttributeType::WORD => {
+            let (remaining, value) = be_i32(input)?;
+            if value >= 0x81BF1 {
+                Ok((remaining, Some(WordType(db1_dehash(value as u32).into()))))
+            } else if value == 1 && remaining.len() >= 4 {
+                let (remaining, value) = be_i32(remaining)?;
+                Ok((remaining, Some(WordType(db1_dehash(value as u32).into()))))
+            } else {
+                Ok((remaining, Some(IntegerType(value))))
+            }
+        }
+        DbAttributeType::INTVEC => {
+            let (payload, len) = be_u32(input)?;
+            let len = len as usize;
+            if len > payload.len() / 4 {
+                return Err(nom::Err::Error(nom::error::make_error(
+                    input,
+                    ErrorKind::Count,
+                )));
+            }
+            let (remaining, values) = count(be_i32, len)(payload)?;
+            Ok((remaining, Some(IntArrayType(values))))
+        }
+        _ => Ok((input, None)),
+    }
+}
+
 /// 获取已知显式属性的原始数据解析（不包含UDA异步处理）
 pub fn parse_raw_explicit_attrs<'a>(
     input: &'a [u8],
@@ -1817,14 +1863,22 @@ pub fn parse_raw_explicit_attrs<'a>(
                 if attr_info_map.contains_key(&att_name) {
                     let attr_info = attr_info_map.get_mut(&att_name).unwrap();
                     // dbg!(&attr_info.value());
-                    // 根据获取到的type hash值，拿到需要的类型
-                    match attr_info.default_val {
-                        InvalidType => {}
-                        IntegerType(_) => {
+                    // Descriptor type wins over placeholder defaults used by
+                    // SYST DBMDAT WORD fields and integer-vector fields.
+                    match (attr_info.att_type, attr_info.default_val.clone()) {
+                        (DbAttributeType::WORD | DbAttributeType::INTVEC, _) => {
+                            let (_, value) = parse_descriptor_typed_explicit_value(
+                                tmp_input,
+                                attr_info.att_type,
+                            )?;
+                            att_value = value;
+                        }
+                        (_, InvalidType) => {}
+                        (_, IntegerType(_)) => {
                             let (_, val) = be_i32(tmp_input)?;
                             att_value = Some(IntegerType(val));
                         }
-                        StringType(_) => {
+                        (_, StringType(_)) => {
                             let (_, a) = be_u32(tmp_input)?;
                             let len_a = a as usize;
                             if tmp_input.len() > 4 && 4 + len_a <= tmp_input.len() {
@@ -1837,7 +1891,7 @@ pub fn parse_raw_explicit_attrs<'a>(
                                 // println!("error 显示 tmp_input={:#04X?}", tmp_input);
                             }
                         }
-                        DoubleType(_) => {
+                        (_, DoubleType(_)) => {
                             let dou_len = tmp_input.len() / 4;
                             if dou_len == 1 {
                                 let (_, val) = be_i32(tmp_input)?;
@@ -1847,7 +1901,7 @@ pub fn parse_raw_explicit_attrs<'a>(
                                 att_value = Some(DoubleType(val));
                             }
                         }
-                        DoubleArrayType(_) => {
+                        (_, DoubleArrayType(_)) => {
                             let mut bytes_len = tmp_input.len() / 4;
                             if bytes_len >= 3 {
                                 bytes_len -= 1; //去掉一个自身
@@ -1881,7 +1935,7 @@ pub fn parse_raw_explicit_attrs<'a>(
                                 }
                             }
                         }
-                        StringArrayType(_) => {
+                        (_, StringArrayType(_)) => {
                             let (tmp_input, len) = be_u32(tmp_input)?;
                             let len = len as usize;
                             let mut tmp_input = tmp_input;
@@ -1896,8 +1950,8 @@ pub fn parse_raw_explicit_attrs<'a>(
                             //     dbg!(&att_value);
                             // }
                         }
-                        BoolArrayType(_) => {}
-                        IntArrayType(_) => {
+                        (_, BoolArrayType(_)) => {}
+                        (_, IntArrayType(_)) => {
                             let (tmp_input, len) = be_u32(tmp_input)?;
                             let len = len as usize;
                             let mut tmp_input = tmp_input;
@@ -1909,22 +1963,22 @@ pub fn parse_raw_explicit_attrs<'a>(
                             }
                             att_value = Some(IntArrayType(data));
                         }
-                        BoolType(_) => {
+                        (_, BoolType(_)) => {
                             let (_, val) = be_u32(tmp_input)?;
                             att_value = Some(BoolType(val != 0));
                         }
-                        Vec3Type(_) => {
+                        (_, Vec3Type(_)) => {
                             let (l, v) = be_i32(tmp_input)?;
                             let _len = v as usize;
                             let data = parse_to_f64_arr(l, 3).try_into().unwrap();
                             att_value = Some(Vec3Type(data));
                         }
-                        ElementType(_) => {
+                        (_, ElementType(_)) => {
                             let (_, (ref_0, ref_1)) = tuple((be_u32, be_u32))(tmp_input)?;
                             let refno = RefU64::from_two_nums(ref_0, ref_1);
                             att_value = Some(RefU64Type(refno));
                         }
-                        WordType(_) => {
+                        (_, WordType(_)) => {
                             let (tmp_bytes, val) = be_i32(tmp_input)?;
                             if val >= 0x81BF1 {
                                 let val_word = db1_dehash(val as u32);
@@ -1934,15 +1988,17 @@ pub fn parse_raw_explicit_attrs<'a>(
                                 let (_, val) = be_i32(tmp_bytes)?;
                                 let val_word = db1_dehash(val as u32);
                                 att_value = Some(WordType(val_word.into()));
+                            } else {
+                                att_value = Some(IntegerType(val));
                             }
                         }
-                        RefU64Type(_) => {
+                        (_, RefU64Type(_)) => {
                             let (_, (ref_0, ref_1)) = tuple((be_u32, be_u32))(tmp_input)?;
                             let refno = RefU64::from_two_nums(ref_0, ref_1);
                             att_value = Some(RefU64Type(refno));
                         }
-                        StringHashType(_) => {}
-                        RefU64Array(_) => {
+                        (_, StringHashType(_)) => {}
+                        (_, RefU64Array(_)) => {
                             let (tmp_input, len) = be_u32(tmp_input)?;
                             let len = len as usize;
                             let mut tmp_input = tmp_input;
@@ -4413,9 +4469,12 @@ pub(crate) static NOUN_TYPES_MAP: phf::Map<i32, &'static str> = phf_map! {
 #[cfg(test)]
 mod boundary_tests {
     use super::{
-        padded_implicit_end, parse_ele_children, parse_ele_membs, parse_raw_ele_data,
-        parse_raw_element_identity,
+        padded_implicit_end, parse_descriptor_typed_explicit_value, parse_ele_children,
+        parse_ele_membs, parse_implicit_attr_value, parse_raw_ele_data, parse_raw_element_identity,
     };
+    use aios_core::AttrVal::{IntArrayType, IntegerType, StringType, WordType};
+    use aios_core::pdms_types::{AttrInfo, DbAttributeType};
+    use aios_core::tool::db_tool::db1_hash;
 
     fn identity_record(noun_hash: i32) -> [u8; 24] {
         let mut input = [0_u8; 24];
@@ -4498,5 +4557,67 @@ mod boundary_tests {
 
         assert_eq!(identity.noun_name, "BOX");
         assert_ne!(identity.noun_name, "MNUM");
+    }
+
+    #[test]
+    fn implicit_intvec_uses_descriptor_type_when_default_is_string() {
+        let mut input = Vec::new();
+        for value in [4_i32, 114, 10, 1, 2003] {
+            input.extend_from_slice(&value.to_be_bytes());
+        }
+        let info = AttrInfo {
+            name: "MARK".into(),
+            hash: 761116,
+            offset: 0,
+            default_val: StringType(String::new()),
+            att_type: DbAttributeType::INTVEC,
+            ityp: None,
+        };
+
+        let (_, value) = parse_implicit_attr_value(&input, &info, false, 0, 5).unwrap();
+
+        match value {
+            IntArrayType(values) => assert_eq!(values, vec![114, 10, 1, 2003]),
+            other => panic!("expected IntArrayType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn implicit_intvec_rejects_a_count_beyond_its_attribute_extent() {
+        let mut input = Vec::new();
+        for value in [4_i32, 114, 10, 1, 2003] {
+            input.extend_from_slice(&value.to_be_bytes());
+        }
+        let info = AttrInfo {
+            name: "MARK".into(),
+            hash: 761116,
+            offset: 0,
+            default_val: StringType(String::new()),
+            att_type: DbAttributeType::INTVEC,
+            ityp: None,
+        };
+
+        assert!(parse_implicit_attr_value(&input, &info, false, 0, 4).is_err());
+    }
+
+    #[test]
+    fn explicit_dbmdat_words_use_descriptor_type_when_defaults_are_strings() {
+        let (_, dbmval) = parse_descriptor_typed_explicit_value(
+            &(db1_hash("ALPHA") as i32).to_be_bytes(),
+            DbAttributeType::WORD,
+        )
+        .unwrap();
+        let (_, dbmext) =
+            parse_descriptor_typed_explicit_value(&123_i32.to_be_bytes(), DbAttributeType::WORD)
+                .unwrap();
+
+        match dbmval {
+            Some(WordType(value)) => assert_eq!(value, "ALPHA"),
+            other => panic!("expected DBMVAL word, got {other:?}"),
+        }
+        match dbmext {
+            Some(IntegerType(value)) => assert_eq!(value, 123),
+            other => panic!("expected DBMEXT integer word payload, got {other:?}"),
+        }
     }
 }
